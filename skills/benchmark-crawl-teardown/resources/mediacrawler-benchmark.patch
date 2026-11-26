@@ -1,0 +1,155 @@
+# MediaCrawler 对标调研模式补丁（benchmark-crawl-teardown 资源）
+# 基于 NanmiCoder/MediaCrawler d172fc8（2026-11-03）原版。用法：在 MediaCrawler 根目录 git apply <本文件>
+# 打不上时（上游改版），按 collect-guide.md 的「补丁要点」手动改 4 处。所有改动挂在 DY_BENCHMARK_MODE=1 开关后。
+diff --git a/config/dy_config.py b/config/dy_config.py
+index 20869a1..9bcf33f 100644
+--- a/config/dy_config.py
++++ b/config/dy_config.py
+@@ -44,3 +44,13 @@ DY_CREATOR_ID_LIST = [
+     "MS4wLjABAAAATJPY7LAlaa5X-c8uNdWkvz0jUGgpw4eeXIwu_8BhvqE"
+     # ........................
+ ]
++
++# ---- 对标调研模式（benchmark-crawl-teardown 用，默认关闭，不影响原有用法）----
++# 开启方式：运行前设环境变量 DY_BENCHMARK_MODE=1，只作用于 --type creator。
++# 开启后：取消每号 10 条上限、翻到 DY_CREATOR_SINCE 之前就停、直接用作品列表数据（不再逐条请求详情）、
++#         额外保存 duration / is_top / source_creator（你提供的主页 sec_user_id）/ source_follower_count。
++# 额外字段只适合 json / jsonl / csv 导出。
++import os as _os
++DY_BENCHMARK_MODE = _os.getenv("DY_BENCHMARK_MODE", "0") == "1"
++DY_CREATOR_SINCE = _os.getenv("DY_CREATOR_SINCE", "")  # "YYYY-MM-DD"，早于此日期的非置顶作品不再采集
++DY_CREATOR_MAX_POSTS = int(_os.getenv("DY_CREATOR_MAX_POSTS", "300"))  # 每号安全上限
+diff --git a/media_platform/douyin/client.py b/media_platform/douyin/client.py
+index c361528..5280b5b 100644
+--- a/media_platform/douyin/client.py
++++ b/media_platform/douyin/client.py
+@@ -28,6 +28,7 @@ from playwright.async_api import BrowserContext
+ 
+ from base.base_crawler import AbstractApiClient
+ from proxy.proxy_mixin import ProxyRefreshMixin
++import config
+ from tools import utils
+ from tools.httpx_util import make_async_client
+ from var import request_keyword_var
+@@ -343,11 +344,11 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
+         }
+         return await self.get(uri, params)
+ 
+-    async def get_user_aweme_posts(self, sec_user_id: str, max_cursor: str = "") -> Dict:
++    async def get_user_aweme_posts(self, sec_user_id: str, max_cursor: str = "", count: int = 10) -> Dict:
+         uri = "/aweme/v1/web/aweme/post/"
+         params = {
+             "sec_user_id": sec_user_id,
+-            "count": 18,
++            "count": count,
+             "max_cursor": max_cursor,
+             "locate_query": "false",
+             "publish_video_strategy_type": 2,
+@@ -355,18 +356,42 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
+         return await self.get(uri, params)
+ 
+     async def get_all_user_aweme_posts(self, sec_user_id: str, callback: Optional[Callable] = None):
++        benchmark = getattr(config, "DY_BENCHMARK_MODE", False)
++        limit = config.DY_CREATOR_MAX_POSTS if benchmark else min(config.CRAWLER_MAX_NOTES_COUNT, 10)
++        since_ts = 0
++        if benchmark and getattr(config, "DY_CREATOR_SINCE", ""):
++            import datetime
++            since_ts = int(datetime.datetime.strptime(config.DY_CREATOR_SINCE, "%Y-%m-%d").timestamp())
+         posts_has_more = 1
+         max_cursor = ""
+         result = []
+-        while posts_has_more == 1:
+-            aweme_post_res = await self.get_user_aweme_posts(sec_user_id, max_cursor)
++        reached_since = False
++        while posts_has_more == 1 and len(result) < limit:
++            aweme_post_res = await self.get_user_aweme_posts(sec_user_id, max_cursor, count=18 if benchmark else 10)
+             posts_has_more = aweme_post_res.get("has_more", 0)
+             max_cursor = aweme_post_res.get("max_cursor")
+             aweme_list = aweme_post_res.get("aweme_list") if aweme_post_res.get("aweme_list") else []
+             utils.logger.info(f"[DouYinClient.get_all_user_aweme_posts] get sec_user_id:{sec_user_id} video len : {len(aweme_list)}")
++            reached_since = False
++            if since_ts:
++                kept = []
++                for item in aweme_list:
++                    if (item.get("create_time") or 0) >= since_ts:
++                        kept.append(item)
++                    elif not item.get("is_top"):
++                        reached_since = True  # 非置顶作品已早于起始日，后面只会更早
++                aweme_list = kept
++            aweme_list = aweme_list[:max(0, limit - len(result))]
+             if callback:
+                 await callback(aweme_list)
+             result.extend(aweme_list)
++            if reached_since:
++                utils.logger.info(f"[DouYinClient.get_all_user_aweme_posts] reached DY_CREATOR_SINCE={config.DY_CREATOR_SINCE}, stop paging")
++                break
++            await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
++        if benchmark:
++            status = "reached_since" if reached_since else ("reached_end" if posts_has_more != 1 else "hit_max_posts")
++            utils.logger.info(f"[DouYinClient.get_all_user_aweme_posts] BENCHMARK sec_user_id:{sec_user_id} total={len(result)} status={status}")
+         return result
+ 
+     async def resolve_short_url(self, short_url: str) -> str:
+diff --git a/media_platform/douyin/core.py b/media_platform/douyin/core.py
+index 10380a6..e5345f2 100644
+--- a/media_platform/douyin/core.py
++++ b/media_platform/douyin/core.py
+@@ -290,6 +290,24 @@ class DouYinCrawler(AbstractCrawler):
+             if creator_info:
+                 await douyin_store.save_creator(user_id, creator=creator_info)
+ 
++            if getattr(config, "DY_BENCHMARK_MODE", False):
++                # 对标调研模式：作品列表已含互动数据，直接保存，不再逐条请求详情（请求量减半）
++                u = (creator_info or {}).get("user") or {}
++                follower_count = u.get("follower_count")
++                # 对标账号是公开的创作者主页，调研需要真实名称和主页公开信息
++                extra = {"source_creator": user_id, "source_follower_count": follower_count,
++                         "source_nickname": u.get("nickname"), "source_total_favorited": u.get("total_favorited"),
++                         "source_aweme_count": u.get("aweme_count"), "source_signature": u.get("signature"),
++                         "source_ip": u.get("ip_location")}
++
++                async def _save_list(video_list: List[Dict], _extra=extra):
++                    for aweme_item in video_list:
++                        await douyin_store.update_douyin_aweme(aweme_item=aweme_item, benchmark_extra=_extra)
++
++                all_video_list = await self.dy_client.get_all_user_aweme_posts(sec_user_id=user_id, callback=_save_list)
++                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
++                continue
++
+             # Get all video information of the creator
+             all_video_list = await self.dy_client.get_all_user_aweme_posts(sec_user_id=user_id, callback=self.fetch_creator_video_detail)
+ 
+diff --git a/store/douyin/__init__.py b/store/douyin/__init__.py
+index 1d5e2b9..3c2d46f 100644
+--- a/store/douyin/__init__.py
++++ b/store/douyin/__init__.py
+@@ -21,7 +21,7 @@
+ # @Author  : relakkes@gmail.com
+ # @Time    : 2024/1/14 18:46
+ # @Desc    :
+-from typing import List
++from typing import Dict, List, Optional
+ 
+ import config
+ from media_platform.douyin.media import extract_cover_url, extract_image_urls, extract_video_urls
+@@ -91,7 +91,7 @@ def _extract_music_download_url(aweme_detail: Dict) -> str:
+     return music_url
+ 
+ 
+-async def update_douyin_aweme(aweme_item: Dict):
++async def update_douyin_aweme(aweme_item: Dict, benchmark_extra: Optional[Dict] = None):
+     aweme_id = aweme_item.get("aweme_id")
+     user_info = aweme_item.get("author", {})
+     interact_info = aweme_item.get("statistics", {})
+@@ -115,6 +115,11 @@ async def update_douyin_aweme(aweme_item: Dict):
+         "note_download_url": ",".join(extract_image_urls(aweme_item)),
+         "source_keyword": source_keyword_var.get(),
+     }
++    if benchmark_extra is not None:
++        # 对标调研模式额外字段（仅 json/jsonl/csv 导出使用）
++        save_content_item["duration"] = aweme_item.get("duration")  # 毫秒；图文为 0
++        save_content_item["is_top"] = 1 if aweme_item.get("is_top") else 0
++        save_content_item.update(benchmark_extra)
+     utils.logger.info(f"[store.douyin.update_douyin_aweme] douyin aweme id:{aweme_id}, title:{save_content_item.get('title')}")
+     await DouyinStoreFactory.create_store().store_content(content_item=save_content_item)
+ 
